@@ -1,9 +1,27 @@
+import builtins
 import os
+import re
 import smtplib
 from email.mime.text import MIMEText
 from typing import Any, Literal
 
 import httpx
+
+
+_FAILURE_MESSAGES: list[str] = []
+_ORIGINAL_PRINT = builtins.print
+
+
+def _record_failure_messages(*args, **kwargs):
+	"""保留控制台输出，并收集签到过程中的失败信息。"""
+	separator = kwargs.get('sep', ' ')
+	message = separator.join(str(arg) for arg in args)
+	if '[FAILED]' in message:
+		_FAILURE_MESSAGES.append(message)
+	_ORIGINAL_PRINT(*args, **kwargs)
+
+
+builtins.print = _record_failure_messages
 
 
 class NotificationKit:
@@ -56,12 +74,63 @@ class NotificationKit:
 
 		return response
 
+	@staticmethod
+	def _email_title(title: str, content: str) -> str:
+		"""将签到统计转换为中文邮件标题。"""
+		match = re.search(r'\[SUCCESS\]\s+Success:\s*(\d+)\s*/\s*(\d+)', content)
+		if match:
+			success_count, total_count = match.groups()
+			return f'AnyRouter 签到：成功 {success_count}/{total_count}'
+		if title == 'AnyRouter Check-in Alert':
+			return 'AnyRouter 签到通知'
+		return title
+
+	@staticmethod
+	def _failure_details() -> str:
+		"""按账号整理失败原因。"""
+		account_errors: dict[str, list[str]] = {}
+		global_errors: list[str] = []
+		account_pattern = re.compile(r'^\[FAILED\]\s+([^:]+):\s*(.+)$')
+
+		for message in _FAILURE_MESSAGES:
+			match = account_pattern.match(message.strip())
+			if match:
+				account_name, error = match.groups()
+				errors = account_errors.setdefault(account_name.strip(), [])
+				if error not in errors:
+					errors.append(error)
+				continue
+
+			error = message.replace('[FAILED]', '', 1).strip()
+			if error and error not in global_errors:
+				global_errors.append(error)
+
+		if not account_errors and not global_errors:
+			return ''
+
+		lines = ['失败详情：']
+		for account_name, errors in account_errors.items():
+			lines.append(f'- {account_name}')
+			for error in errors:
+				lines.append(f'  - {error}')
+		for error in global_errors:
+			lines.append(f'- {error}')
+		return '\n'.join(lines)
+
 	def send_email(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text'):
 		if not self.email_user or not self.email_pass or not self.email_to:
 			raise ValueError('Email configuration not set')
 
 		# 如果未设置 EMAIL_SENDER，使用 EMAIL_USER 作为默认值
 		sender = self.email_sender if self.email_sender else self.email_user
+		title = self._email_title(title, content)
+
+		failure_details = self._failure_details()
+		if failure_details:
+			separator = '<br><br>' if msg_type == 'html' else '\n\n'
+			if msg_type == 'html':
+				failure_details = '<br>'.join(failure_details.splitlines())
+			content = f'{content.rstrip()}{separator}{failure_details}'
 
 		# MIMEText 需要 'plain' 或 'html'，而不是 'text'
 		mime_subtype = 'plain' if msg_type == 'text' else 'html'
